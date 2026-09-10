@@ -1,0 +1,237 @@
+import logging
+from datetime import time
+from functools import wraps
+
+from telegram import Update
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ConversationHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
+
+from config import BOT_TOKEN, ALLOWED_USER_IDS
+from database import (
+    init_db,
+    simpan_invoice,
+    cari_invoice,
+    list_jatuh_tempo,
+    list_belum_lunas,
+    tandai_lunas,
+)
+
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
+
+# State untuk ConversationHandler
+FOTO, BPF, NO_FAKTUR, TANGGAL, JTH_TEMPO = range(5)
+
+
+# --- Proteksi akses: cuma user yang ada di ALLOWED_USER_IDS yang bisa pakai bot ---
+def hanya_untuk_admin(func):
+    @wraps(func)
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        if user_id not in ALLOWED_USER_IDS:
+            await update.message.reply_text(
+                f"Maaf, kamu tidak punya akses ke bot ini.\nUser ID kamu: {user_id}"
+            )
+            return ConversationHandler.END
+        return await func(update, context)
+
+    return wrapper
+
+
+# --- /start ---
+@hanya_untuk_admin
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Halo! Bot pencatat invoice apotek siap dipakai.\n\n"
+        "Kirim foto/file faktur kapan saja untuk mulai mencatat.\n\n"
+        "Perintah lain:\n"
+        "/cari <no faktur> - cari invoice\n"
+        "/jatuhtempo - lihat yang mau jatuh tempo (7 hari ke depan)\n"
+        "/belumlunas - lihat semua yang belum lunas\n"
+        "/lunas <no faktur> - tandai invoice sudah lunas\n"
+        "/cancel - batalkan input yang sedang berjalan"
+    )
+
+
+# --- Alur pencatatan invoice baru ---
+@hanya_untuk_admin
+async def terima_foto(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Ambil resolusi foto paling besar, atau dokumen kalau dikirim sebagai file
+    if update.message.photo:
+        file_id = update.message.photo[-1].file_id
+    elif update.message.document:
+        file_id = update.message.document.file_id
+    else:
+        await update.message.reply_text("Kirim dalam bentuk foto atau file ya.")
+        return FOTO
+
+    context.user_data["file_id"] = file_id
+    await update.message.reply_text("Oke, faktur diterima. Asal BPF-nya dari mana?")
+    return BPF
+
+
+async def terima_bpf(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["bpf"] = update.message.text
+    await update.message.reply_text("Nomor fakturnya berapa?")
+    return NO_FAKTUR
+
+
+async def terima_no_faktur(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["no_faktur"] = update.message.text
+    await update.message.reply_text("Tanggal fakturnya kapan? (contoh: 2026-09-10)")
+    return TANGGAL
+
+
+async def terima_tanggal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["tanggal"] = update.message.text
+    await update.message.reply_text("Jatuh temponya kapan? (contoh: 2026-10-10)")
+    return JTH_TEMPO
+
+
+async def terima_jth_tempo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["jth_tempo"] = update.message.text
+    d = context.user_data
+
+    simpan_invoice(
+        d["file_id"], d["bpf"], d["no_faktur"], d["tanggal"], d["jth_tempo"]
+    )
+
+    await update.message.reply_text(
+        "Tersimpan!\n\n"
+        f"BPF: {d['bpf']}\n"
+        f"No. Faktur: {d['no_faktur']}\n"
+        f"Tanggal: {d['tanggal']}\n"
+        f"Jatuh Tempo: {d['jth_tempo']}"
+    )
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+async def batal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    await update.message.reply_text("Dibatalkan.")
+    return ConversationHandler.END
+
+
+# --- Pencarian & laporan ---
+def _format_baris(row):
+    return (
+        f"No. Faktur: {row['no_faktur']}\n"
+        f"BPF: {row['bpf']}\n"
+        f"Tanggal: {row['tanggal']}\n"
+        f"Jatuh Tempo: {row['jth_tempo']}\n"
+        f"Status: {row['status']}"
+    )
+
+
+@hanya_untuk_admin
+async def cari(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Format: /cari <no faktur>")
+        return
+
+    kata_kunci = " ".join(context.args)
+    hasil = cari_invoice(kata_kunci)
+
+    if not hasil:
+        await update.message.reply_text("Tidak ketemu invoice dengan nomor itu.")
+        return
+
+    for row in hasil:
+        await update.message.reply_photo(
+            photo=row["file_id"], caption=_format_baris(row)
+        )
+
+
+@hanya_untuk_admin
+async def jatuh_tempo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    hasil = list_jatuh_tempo(7)
+    if not hasil:
+        await update.message.reply_text("Tidak ada yang jatuh tempo dalam 7 hari ke depan.")
+        return
+
+    teks = "Jatuh tempo dalam 7 hari ke depan:\n\n"
+    teks += "\n\n".join(_format_baris(row) for row in hasil)
+    await update.message.reply_text(teks)
+
+
+@hanya_untuk_admin
+async def belum_lunas(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    hasil = list_belum_lunas()
+    if not hasil:
+        await update.message.reply_text("Semua invoice sudah lunas.")
+        return
+
+    teks = "Invoice yang belum lunas:\n\n"
+    teks += "\n\n".join(_format_baris(row) for row in hasil)
+    await update.message.reply_text(teks)
+
+
+@hanya_untuk_admin
+async def lunas(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Format: /lunas <no faktur>")
+        return
+
+    no_faktur = " ".join(context.args)
+    jumlah = tandai_lunas(no_faktur)
+
+    if jumlah:
+        await update.message.reply_text(f"Invoice {no_faktur} ditandai lunas.")
+    else:
+        await update.message.reply_text("Tidak ketemu invoice dengan nomor itu.")
+
+
+# --- Reminder harian otomatis, jam 8 pagi ---
+async def reminder_harian(context: ContextTypes.DEFAULT_TYPE):
+    hasil = list_jatuh_tempo(3)  # H-3
+    if not hasil:
+        return
+
+    teks = "Pengingat: invoice berikut jatuh tempo dalam 3 hari ke depan:\n\n"
+    teks += "\n\n".join(_format_baris(row) for row in hasil)
+
+    for user_id in ALLOWED_USER_IDS:
+        await context.bot.send_message(chat_id=user_id, text=teks)
+
+
+def main():
+    init_db()
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    conv_handler = ConversationHandler(
+        entry_points=[MessageHandler(filters.PHOTO | filters.Document.ALL, terima_foto)],
+        states={
+            FOTO: [MessageHandler(filters.PHOTO | filters.Document.ALL, terima_foto)],
+            BPF: [MessageHandler(filters.TEXT & ~filters.COMMAND, terima_bpf)],
+            NO_FAKTUR: [MessageHandler(filters.TEXT & ~filters.COMMAND, terima_no_faktur)],
+            TANGGAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, terima_tanggal)],
+            JTH_TEMPO: [MessageHandler(filters.TEXT & ~filters.COMMAND, terima_jth_tempo)],
+        },
+        fallbacks=[CommandHandler("cancel", batal)],
+    )
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(conv_handler)
+    app.add_handler(CommandHandler("cari", cari))
+    app.add_handler(CommandHandler("jatuhtempo", jatuh_tempo))
+    app.add_handler(CommandHandler("belumlunas", belum_lunas))
+    app.add_handler(CommandHandler("lunas", lunas))
+
+    # Jadwalkan reminder tiap jam 8 pagi (waktu server)
+    app.job_queue.run_daily(reminder_harian, time=time(hour=8, minute=0))
+
+    logger.info("Bot mulai jalan...")
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
